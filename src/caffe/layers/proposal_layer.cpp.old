@@ -1,0 +1,417 @@
+#include "caffe/layers/proposal_layer.hpp"
+#include <math.h>
+#include <opencv2/core/core.hpp>
+using std::max;
+using std::min;
+using std::floor;
+using std::ceil;
+#define max(a, b) (((a)>(b)) ? (a) :(b))
+#define min(a, b) (((a)<(b)) ? (a) :(b))
+
+namespace caffe {
+//Using for box sort
+struct Info {
+	float score;
+	const float* head;
+};
+
+bool compare(const Info& Info1, const Info& Info2) {
+	return Info1.score > Info2.score;
+}
+
+template<typename Dtype>
+//贪心法nms, 假定proposals是降序, 只返回topN
+void ProposalLayer<Dtype>::nms(vector<int>& keep, float* proposals,
+		int proposals_len, float nms_thresh, int after_nms_topN) {
+	vector<int> order(proposals_len, 0);
+	for (int i = 0; i < order.size(); i++)
+		order[i] = i;
+	//compute all areas for all proposals.
+	vector<float> areas;
+	for (int i = 0; i < proposals_len; i++) {
+		areas.push_back(
+				(proposals[i * 5 + 2] - proposals[i * 5 + 0] + 1)
+						* (proposals[i * 5 + 3] - proposals[i * 5 + 1] + 1));
+	}
+
+	while (order.size() > 0) {
+		int i = order[0];
+		// float area = (proposals[i*5 + 2] - proposals[i*5 + 0] + 1) * (proposals[i*5 + 3] - proposals[i*5 + 1] + 1);
+		keep.push_back(i); //保留
+		if (keep.size() == after_nms_topN)
+			return;
+		//计算 i proposal   和其他order中剩余的所有proposals的iou.
+		vector<int> next_order;
+		for (int j = 1; j < order.size(); j++) {
+			float xx1 = max(proposals[i * 5 + 0], proposals[order[j] * 5 + 0]);
+			float yy1 = max(proposals[i * 5 + 1], proposals[order[j] * 5 + 1]);
+			float xx2 = min(proposals[i * 5 + 2], proposals[order[j] * 5 + 2]);
+			float yy2 = min(proposals[i * 5 + 3], proposals[order[j] * 5 + 3]);
+			float w = max(0.0, xx2 - xx1 + 1);
+			float h = max(0.0, yy2 - yy1 + 1);
+			float inter = w * h;
+			float ovr = inter / (areas[i] + areas[order[j]] - inter);
+			if (ovr < nms_thresh) {
+				next_order.push_back(order[j]);
+			}
+		}
+		order = next_order; //copy
+	}
+
+}
+
+template<typename Dtype>
+void ProposalLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+		const vector<Blob<Dtype>*>& top) {
+    ProposalParameter proposal_param = this->layer_param_.proposal_param();
+    CHECK_GT(proposal_param.feat_stride(), 0)<< "feat_stride must be > 0";
+    vector<float> anchor_scales;
+    vector<float> anchor_ratios;
+    this->feat_stride = proposal_param.feat_stride();
+    if (proposal_param.anchor_sizes_size() > 0) {
+    	for (int c = 0; c < proposal_param.anchor_sizes_size(); ++c) {
+      		anchor_scales.push_back(proposal_param.anchor_sizes(c));
+      }
+    }
+    if (proposal_param.anchor_ratios_size() > 0) {
+        for (int c = 0; c < proposal_param.anchor_ratios_size(); ++c) {
+                anchor_ratios.push_back(proposal_param.anchor_ratios(c));
+      }
+    }  
+    this->num_anchors = anchor_scales.size() * anchor_ratios.size();
+    this->pre_nms_topN = proposal_param.pre_nms_top_n();
+    this->after_nms_topN = proposal_param.post_nms_top_n();
+    this->nms_thresh = proposal_param.nms_thresh();
+    this->min_size = proposal_param.min_size();
+    this->classNum = proposal_param.class_num();
+    this->rpn_post_th = proposal_param.rpn_post_th();
+    this->anchor_base_size = proposal_param.anchor_base_size();
+    LOG(INFO)<< "feat stride for proposal_layer: " << feat_stride;
+    LOG(INFO)<< "pre_nms_topN for proposal_layer: " << this->pre_nms_topN;
+    LOG(INFO)<< "after_nms_topN for proposal_layer: " << this->after_nms_topN;
+    LOG(INFO)<< "nms_thresh for proposal_layer: " << this->nms_thresh;
+    LOG(INFO)<< "min_sizse for proposal_layer: " << this->min_size;
+    LOG(INFO)<< "anchor_scales for proposal_layer: " << anchor_scales.size();
+    LOG(INFO)<< "anchor_ratios for proposal_layer: " << anchor_ratios.size();
+    LOG(INFO)<< "class num for proposal_layer: " << this->classNum;   
+    LOG(INFO)<< "rpn post threshold for proposal_layer: " << this->rpn_post_th;
+    LOG(INFO)<< "anchor base size for proposal_layer: " << this->anchor_base_size;
+    //generate base anchors, 9x4
+    generate_anchors(anchor_scales,anchor_ratios,  this->base_anchors, this->anchor_base_size);
+}
+template<typename Dtype>
+void ProposalLayer<Dtype>::generate_anchors(vector<float>& anchor_scales, vector<float>& anchor_ratios,
+		vector<int>& result_anchors, int anchor_base_size) {
+
+	//int base_anchor[4] = {0, 0, 15, 15};
+	//generate ratio_anchors for each aspect ratio. 
+	int base_w = anchor_base_size;
+	int base_h = anchor_base_size;
+	//float x_ctr = base_anchor[0] + 0.5 * (w - 1);
+	//float y_ctr = base_anchor[1] + 0.5 * (h - 1);
+	float base_x_ctr = 0.5 * (base_w - 1);
+	float base_y_ctr = 0.5 * (base_h - 1);
+	int base_size = base_w * base_h; 
+	vector<float> size_ratios(anchor_ratios.size(), 0);
+	vector<float> ratio_anchors;
+	for(int i = 0; i < anchor_ratios.size(); i++)
+	{
+		size_ratios[i] = float(base_size) / anchor_ratios[i] ;
+		float ws = round(sqrt( size_ratios[i] ));
+		float hs = round(ws * anchor_ratios[i] );
+		ratio_anchors.push_back(base_x_ctr - 0.5 * (ws - 1));
+                ratio_anchors.push_back(base_y_ctr - 0.5 * (hs - 1));
+                ratio_anchors.push_back(base_x_ctr + 0.5 * (ws - 1));
+                ratio_anchors.push_back(base_y_ctr + 0.5 * (hs - 1));	
+	}
+	for (int i = 0; i < anchor_ratios.size(); i++) {
+		for (int j = 0; j < anchor_scales.size(); j++) {
+			int w = ratio_anchors[i * 4 + 2] - ratio_anchors[i * 4] + 1;
+			int h = ratio_anchors[i * 4 + 3] - ratio_anchors[i * 4 + 1] + 1;
+			float x_ctr = ratio_anchors[i * 4] + 0.5 * (w - 1);
+			float y_ctr = ratio_anchors[i * 4 + 1] + 0.5 * (h - 1);
+			int ws = int(w * anchor_scales[j]);
+			int hs = int(h * anchor_scales[j]);
+			//x_ctr, y_ctr, ws, hs -> x1,y1,x2,y2
+			result_anchors.push_back(int(x_ctr - 0.5 * (ws - 1)));
+			result_anchors.push_back(int(y_ctr - 0.5 * (hs - 1)));
+			result_anchors.push_back(int(x_ctr + 0.5 * (ws - 1)));
+			result_anchors.push_back(int(y_ctr + 0.5 * (hs - 1)));
+		}
+	}
+}
+
+template<typename Dtype>
+void ProposalLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+		const vector<Blob<Dtype>*>& top) {
+	vector<int> top_shape(2);
+	top_shape[0] = this->after_nms_topN;
+	top_shape[1] = 5;
+	top[0]->Reshape(top_shape);
+}
+
+/*
+ * ===  FUNCTION  ======================================================================
+ *         Name:  bbox_transform_inv
+ *  Description:  Compute bounding box regression value
+ * =====================================================================================
+ */
+template<typename Dtype>
+void ProposalLayer<Dtype>::bbox_transform_inv(int num, float* box_deltas,
+		float* boxes, float* pred, int img_height,
+		const int img_width) {
+	float width, height, ctr_x, ctr_y, dx, dy, dw, dh, pred_ctr_x, pred_ctr_y,
+			pred_w, pred_h;
+	int result_count = 0;
+	for (int i = 0; i < num; i++)    //for each anchor.
+	{
+		width = boxes[i * 4 + 2] - boxes[i * 4 + 0] + 1.0;    //box width
+		height = boxes[i * 4 + 3] - boxes[i * 4 + 1] + 1.0;    //box height
+		ctr_x = boxes[i * 4 + 0] + 0.5 * width;    //center of box.
+		ctr_y = boxes[i * 4 + 1] + 0.5 * height;    //center of box.
+		dx = box_deltas[i * 4 + 0];
+		dy = box_deltas[i * 4 + 1];
+		dw = box_deltas[i * 4 + 2];
+		dh = box_deltas[i * 4 + 3];
+		pred_ctr_x = ctr_x + width * dx;
+		pred_ctr_y = ctr_y + height * dy;
+		pred_w = width * exp(dw);
+		pred_h = height * exp(dh);
+		float x1 = max(min(pred_ctr_x - 0.5* pred_w, img_width -1), 0);
+		float y1 = max(min(pred_ctr_y - 0.5* pred_h, img_height -1), 0);
+		float x2 = max(min(pred_ctr_x + 0.5* pred_w, img_width -1), 0);
+		float y2 = max(min(pred_ctr_y + 0.5* pred_h, img_height -1), 0);
+		// std::cout << pred[i*5+0] << " " << pred[i*5+1] << " " <<pred[i*5+2] <<  " " <<  pred[i*5+3] << std::endl;
+//		if (((x2 - x1 + 1) < min_size * img_scale) || ((y2 - y1 + 1) < min_size * img_scale))
+//			continue;
+		pred[result_count * 5 + 0] = x1;
+		pred[result_count * 5 + 1] = y1;
+		pred[result_count * 5 + 2] = x2;
+		pred[result_count * 5 + 3] = y2;
+//		pred[result_count * 5 + 4] = pred_cls[i];
+		result_count++;
+	}
+//	return result_count;
+}
+/*
+ * remove box < min_size*scale, fill the score for each box.
+ *
+ *
+*/
+template<typename Dtype>
+int ProposalLayer<Dtype>::remove_min_box(int num, float* box, float* pred_cls, float* pred,  int min_size, float img_scale, float rpn_post_th )
+{
+	int result_count = 0;
+	for (int i = 0; i < num; i++)    //for each anchor.
+	{
+		float x1 = box[i * 5 + 0] ;
+		float y1 = box[i * 5 + 1] ;
+		float x2 = box[i * 5 + 2] ;
+		float y2 = box[i * 5 + 3] ;
+		if (((x2 - x1 + 1) < min_size * img_scale) || ((y2 - y1 + 1) < min_size * img_scale))
+			continue;
+		if ( pred_cls[i] < rpn_post_th)
+			continue;
+		pred[result_count * 5 + 0] = x1;
+		pred[result_count * 5 + 1] = y1;
+		pred[result_count * 5 + 2] = x2;
+		pred[result_count * 5 + 3] = y2;
+		pred[result_count * 5 + 4] = pred_cls[i];
+		result_count ++;
+	}
+	return result_count;
+}
+
+
+template<typename Dtype>
+void ProposalLayer<Dtype>::boxes_sort(int num, int sorted_num,
+		const float* pred, float* sorted_pred) {
+	vector<Info> my;
+	Info tmp;
+	for (int i = 0; i < num; i++) {
+		tmp.score = pred[i * 5 + 4];
+		tmp.head = pred + i * 5;
+		my.push_back(tmp);
+	}
+//	std::cout << "all sort size: " << my.size() << "; sorted_num:" << sorted_num << std::endl;
+	std::partial_sort(my.begin(), my.begin()+sorted_num,  my.end(), compare);
+	
+	//write only sorted_num to sorted_pred
+	
+	for (int i = 0; i < sorted_num; i++) {
+		for (int j = 0; j < 5; j++) {
+			sorted_pred[i * 5 + j] = my[i].head[j];
+		//	std::cout << sorted_pred[i * 5+ j] << " ";
+		}
+	}
+}
+
+template<typename Dtype>
+void ProposalLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+		const vector<Blob<Dtype>*>& top) {
+	int rois_total_num = 0;
+	//long t_start = cv::getTickCount();
+    //计算所有的anchors的坐标，然后根据bbox，生成新的坐标。
+	//remove predicted boxes with either height or width < threshold
+	//sort all (proposal, score) pairs by score from highest to lowest
+	//take top pre_nms_topN proposals before NMS
+	//apply NMS with threshold 0.7 to remaining proposals
+	//take after_nms_topN proposals after NMS
+	//return the top proposals (-> RoIs top, scores top)
+	CHECK_EQ(1, bottom[0]->num())<< "Only single item batches are supported ";
+	//Output rois blob
+	Dtype* top_data = top[0]->mutable_cpu_data();
+    	caffe_set(top[0]->count(), Dtype(0), top_data);
+	//1. 得到所有anchor的原始位置，（未回归） 和类别无关
+	const Dtype* im_info = bottom[2]->cpu_data();
+	int height = bottom[0]->height();
+	int width = bottom[0]->width();
+	vector<int> shift_x(width, 0);
+	for(int i = 0; i < width; i++)
+	{
+		shift_x[i] = i*this->feat_stride;
+	}
+	vector<int> shift_xx(shift_x.size()*height, 0);
+	for(int i = 0; i < height; i++)
+	{
+		for(int j = 0; j < shift_x.size(); j++)
+		{
+			shift_xx[ shift_x.size() * i + j ] = shift_x[j];
+		}
+	}
+
+	vector<int> shift_y(height, 0);
+	for(int i = 0; i < height; i++)
+	{
+		shift_y[i] = i*this->feat_stride;
+	}
+	vector<int> shift_yy(width * shift_y.size(), 0);
+	for(int i = 0; i < shift_y.size(); i++)
+	{
+		for(int j = 0; j < width; j++)
+		{
+			shift_yy[width * i + j] = shift_y[i];
+		}
+	}
+
+	//shift_xx, shift_yy is the shifts matrix.
+	//Enumerate all shifted anchors:
+	int A = this->num_anchors;
+	int K = shift_xx.size();
+	float* anchors = new float[K*A*4];
+    	for(int i = 0; i < K; i++)
+	{
+		for(int j = 0; j < A; j++)
+		{
+			anchors[i*(A*4) + j*4 + 0] = base_anchors[j * 4 + 0] + shift_xx[i];
+			anchors[i*(A*4) + j*4 + 1] = base_anchors[j * 4 + 1] + shift_yy[i];
+			anchors[i*(A*4) + j*4 + 2] = base_anchors[j * 4 + 2] + shift_xx[i];
+			anchors[i*(A*4) + j*4 + 3] = base_anchors[j * 4 + 3] + shift_yy[i];
+		}
+	}
+
+	const Dtype* bbox_deltas_old = bottom[1]->cpu_data();//1*36*39*39
+	float* bbox_deltas = new float[bottom[1]->count()];//39x39x36
+	//transpose bbox_deltas to : 39(h)*39(w)**36(anchor*)*1(num)
+	//long t1 = cv::getTickCount();
+//	for(int i =0; i < bottom[1]->channels(); i++)
+//	{
+	for(int j = 0; j < bottom[1]->height() * bottom[1]->width(); j++)
+	{
+		for(int i =0; i < bottom[1]->channels(); i++)
+			bbox_deltas[j * bottom[1]->channels() + i] = static_cast<float> (bbox_deltas_old[i*(bottom[1]->height() * bottom[1]->width()) + j]);
+	}
+//	}
+	//double t12 = (cv::getTickCount() - t1)/cv::getTickFrequency()*1000;
+	//double t10 = (cv::getTickCount() - t_start)/cv::getTickFrequency()*1000;
+	//get proposal box coordinates.
+	float * box_proposals = new float[K * A * 5];
+	bbox_transform_inv(K*A,bbox_deltas,anchors,box_proposals, static_cast<int>(im_info[0]), static_cast<int>(im_info[1]));
+	//2. 对每个类别， 分别做anchor的回归，并排序，nms，挑选top的输出。
+	for(int classindex = 1; classindex < this->classNum; classindex++)
+	{
+		//the first set of _num_anchors channels are bg probs, get each class's prob, which we want
+		const Dtype* scores_old = bottom[0]->cpu_data() + (classindex * this->num_anchors * bottom[0]->height() * bottom[0]->width());//1*9*39*39
+		float* scores = new float[bottom[0]->count()/this->classNum];
+		//transpose scores(9x39x39) to : 39x39x9
+		for(int i = 0; i < this->num_anchors;i++)
+		{
+			for(int j = 0; j < bottom[0]->height() * bottom[0]->width(); j++)
+			{
+				scores[j * this->num_anchors + i] = static_cast<float> (scores_old[i * (bottom[0]->height() * bottom[0]->width()) + j]);
+			}
+		}
+		//get propoasal.
+		float * proposals = new float[K * A * 5];
+		int proposals_len = 0;
+		//对每个类别来做，bbox transform, and get classification score for each anchor and remove predicted boxes with either height or width < threshold
+		//add proposal's score, and remove box < min_size.
+		proposals_len = remove_min_box(K*A, box_proposals, scores, proposals,  this->min_size, static_cast<float>(im_info[2]), this->rpn_post_th );
+		//保留pre_nms_topN的proposal
+		int sorted_proposals_len = proposals_len;
+		if(this->pre_nms_topN > 0)
+		{
+			if(this->pre_nms_topN < proposals_len) {
+				sorted_proposals_len = this->pre_nms_topN;
+			}
+		}
+		float * sorted_proposals = new float[sorted_proposals_len*5];
+		//sort and get top sorted_proposals_len boxes.
+		boxes_sort(proposals_len, sorted_proposals_len, proposals, sorted_proposals);
+		//6. apply nms (e.g. threshold = 0.7)
+		vector<int> keep;
+		nms(keep, sorted_proposals, sorted_proposals_len, this->nms_thresh, this->after_nms_topN/(this->classNum-1));
+		//_nms(keep, &num_out, sorted_proposals, proposals_len, 5, this->nms_thresh, 0);
+		for(int i = 0; i < keep.size(); i++)
+		{
+			float item[5];
+			item[0] = 0;
+			item[1] = sorted_proposals[keep[i]*5 + 0];
+			item[2] = sorted_proposals[keep[i]*5 + 1];
+			item[3] = sorted_proposals[keep[i]*5 + 2];
+			item[4] = sorted_proposals[keep[i]*5 + 3];
+			caffe_copy(5, (Dtype *)(item) , top_data + rois_total_num * 5);
+
+			rois_total_num++;
+		}
+		delete []scores;
+		delete []proposals;
+		delete []sorted_proposals;
+	}
+	delete []box_proposals;
+	delete []bbox_deltas;
+	delete []anchors;
+
+    //  double t_end = (cv::getTickCount() - t_start)/cv::getTickFrequency()*1000;
+    //	std::cout << "proposal layer time:" << t_end << "ms" << std::endl;
+	if ( rois_total_num == 0 )
+	{
+		float item[5];
+		memset( item, 0, sizeof(float)*5);
+		caffe_copy(5, (Dtype *)(item), top_data);	
+		rois_total_num++;
+	}	
+	LOG(INFO) << "proposal rois num:" << rois_total_num;
+	
+	vector<int> top_shape(2);
+	top_shape[0] = rois_total_num;
+	top_shape[1] = 5;
+	top[0]->Reshape(top_shape);
+}
+
+template<typename Dtype>
+void ProposalLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+		const vector<bool>& propagate_down,
+		const vector<Blob<Dtype>*>& bottom) {
+	NOT_IMPLEMENTED;
+}
+
+//#ifdef CPU_ONLY
+//STUB_GPU(ProposalLayer);
+//#endif
+
+INSTANTIATE_CLASS(ProposalLayer);
+REGISTER_LAYER_CLASS(Proposal);
+
+}  // namespace caffe
+

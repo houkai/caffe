@@ -1,0 +1,70 @@
+// ------------------------------------------------------------------
+// Faster R-CNN Region Proposal layer. 
+// Written by Yilin Guo.
+// ------------------------------------------------------------------
+
+#ifndef CAFFE_PROPOSAL_LAYERS_HPP_
+#define CAFFE_PROPOSAL_LAYERS_HPP_
+
+#include <vector>
+
+#include "caffe/blob.hpp"
+#include "caffe/common.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/proto/caffe.pb.h"
+
+namespace caffe {
+
+/* ProposalLayer - Region Proposal Layer
+*  
+*  Outputs object detection proposals by applying estimated bounding-box
+*    transformations to a set of regular boxes (called "anchors").
+*/
+template <typename Dtype>
+class ProposalLayer : public Layer<Dtype> {
+ public:
+  explicit ProposalLayer(const LayerParameter& param)
+      : Layer<Dtype>(param) {}
+  virtual void LayerSetUp(const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top);
+  virtual void Reshape(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top);
+
+  virtual inline const char* type() const { return "Proposal"; }
+
+  virtual inline int MinBottomBlobs() const { return 3; }
+  virtual inline int MaxBottomBlobs() const { return 3; }
+  virtual inline int MinTopBlobs() const { return 1; }
+  virtual inline int MaxTopBlobs() const { return 2; }
+  virtual void bbox_transform_inv(int num, float* box_deltas,
+                float* boxes, float* pred, int img_height,
+                const int img_width);
+//  virtual int bbox_transform_inv(int num, float* box_deltas, float* pred_cls, float* boxes, float* pred, int img_height, const  int img_width, const int min_size, const float img_scale);
+  virtual int remove_min_box(int num, float* box, float* scores, float* pred,  int min_size, float img_scale, float rpn_post_th );
+  virtual void boxes_sort(int num, int sorted_num, const float* pred, float* sorted_pred);
+  virtual void  generate_anchors(vector<float> &anchor_scales, vector<float> &anchor_ratios,  vector<int>& result_anchors, int anchor_base_size);
+  //_nms(keep, &num_out, sorted_proposals, proposals_len, 5, this->nms_thresh, 0);
+  virtual void nms(vector<int>& keep, float* proposals, int proposals_len, float nms_thresh, int after_nms_topN); 
+protected:
+  virtual void Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top);
+//  virtual void Forward_gpu(const vector<Blob<Dtype>*>& bottom,
+//      const vector<Blob<Dtype>*>& top);
+  virtual void Backward_cpu(const vector<Blob<Dtype>*>& top,
+      const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom);
+//  virtual void Backward_gpu(const vector<Blob<Dtype>*>& top,
+//      const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom);
+
+  int feat_stride;//feat stride mapping from last conv to input.
+  vector<int>  base_anchors;//the base anchors for one feature.
+  int num_anchors; // num of anchors for one feature.
+  int pre_nms_topN;
+  int after_nms_topN;
+  float nms_thresh;
+  int min_size;//the min box size of original img that we keep.
+  int classNum;
+  float rpn_post_th;
+  int anchor_base_size;
+};
+
+}
+#endif  // CAFFE_PROPOSAL_LAYERS_HPP_
